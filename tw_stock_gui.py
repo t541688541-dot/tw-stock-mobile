@@ -65,6 +65,12 @@ GITHUB_PAGES_INDEX_PATH = GITHUB_PAGES_DIR / "index.html"
 GITHUB_PAGES_404_PATH = GITHUB_PAGES_DIR / "404.html"
 GITHUB_PAGES_LATEST_PATH = GITHUB_PAGES_DIR / "mobile_snapshot_offline.html"
 GITHUB_PAGES_NOJEKYLL_PATH = GITHUB_PAGES_DIR / ".nojekyll"
+GITHUB_PAGES_AUTO_PUBLISH_SECONDS = 3
+GIT_EXECUTABLE_CANDIDATES = [
+    "git",
+    r"C:\Program Files\Git\cmd\git.exe",
+    r"C:\Program Files\Git\bin\git.exe",
+]
 PODCAST_PROJECT_DIR = BASE_DIR / "podcast_llm_project"
 PODCAST_ENV_PATH = PODCAST_PROJECT_DIR / ".env"
 DAILY_ANALYSIS_REFRESH_SECONDS = 2 * 60 * 60
@@ -895,6 +901,8 @@ class ScreenerApp:
         self.auto_refresh_after_id = None
         self.fundamental_refresh_after_id = None
         self.daily_analysis_after_id = None
+        self.github_pages_publish_after_id = None
+        self.github_pages_publish_running = False
         self.analysis_payload = None
         self.analysis_report_text = ""
         self.podcast_rows = load_podcast_recommendations()
@@ -1024,6 +1032,115 @@ class ScreenerApp:
         podcast_meta = self.podcast_meta or podcast_block.get("meta") or {}
         podcast_rows = self.podcast_rows or podcast_block.get("rows") or []
         save_mobile_offline_snapshot(payload, self.watchlist_data, podcast_meta, podcast_rows, analysis_payload)
+        self._schedule_github_pages_publish()
+
+    def _schedule_github_pages_publish(self, delay_ms: int = GITHUB_PAGES_AUTO_PUBLISH_SECONDS * 1000) -> None:
+        if self.github_pages_publish_after_id is not None:
+            self.root.after_cancel(self.github_pages_publish_after_id)
+        self.github_pages_publish_after_id = self.root.after(delay_ms, self._publish_github_pages_async)
+
+    def _publish_github_pages_async(self) -> None:
+        self.github_pages_publish_after_id = None
+        if self.github_pages_publish_running:
+            return
+        self.github_pages_publish_running = True
+        self.status_var.set("手機頁網址同步中...")
+        threading.Thread(target=self._github_pages_publish_worker, daemon=True).start()
+
+    def _find_git_executable(self) -> str:
+        for candidate in GIT_EXECUTABLE_CANDIDATES:
+            if os.path.isabs(candidate):
+                if os.path.exists(candidate):
+                    return candidate
+                continue
+            try:
+                completed = subprocess.run(
+                    [candidate, "--version"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    timeout=10,
+                )
+                if completed.returncode == 0:
+                    return candidate
+            except OSError:
+                continue
+        raise RuntimeError("找不到 Git，無法自動把手機頁網址同步到 GitHub Pages。")
+
+    def _github_pages_publish_worker(self) -> None:
+        try:
+            git_exe = self._find_git_executable()
+            repo_dir = str(BASE_DIR)
+
+            remote_check = subprocess.run(
+                [git_exe, "-C", repo_dir, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=15,
+            )
+            if remote_check.returncode != 0:
+                raise RuntimeError("目前還沒有設定 GitHub repo remote，無法自動同步手機網址。")
+
+            add_cmd = [git_exe, "-C", repo_dir, "add", "docs/index.html", "docs/404.html", "docs/mobile_snapshot_offline.html", "docs/.nojekyll"]
+            added = subprocess.run(
+                add_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=20,
+            )
+            if added.returncode != 0:
+                raise RuntimeError((added.stderr or added.stdout or "git add 失敗").strip())
+
+            status_cmd = [git_exe, "-C", repo_dir, "diff", "--cached", "--quiet", "--", "docs"]
+            status_result = subprocess.run(status_cmd, check=False, timeout=15)
+            if status_result.returncode == 0:
+                self.root.after(0, lambda: self._finish_github_pages_publish("沒有新的手機快照變更需要上傳。"))
+                return
+
+            if status_result.returncode not in (0, 1):
+                raise RuntimeError("無法確認手機頁快照是否有變更。")
+
+            commit_message = f"Update mobile snapshot {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            committed = subprocess.run(
+                [git_exe, "-C", repo_dir, "commit", "-m", commit_message],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=30,
+            )
+            if committed.returncode != 0:
+                raise RuntimeError((committed.stderr or committed.stdout or "git commit 失敗").strip())
+
+            pushed = subprocess.run(
+                [git_exe, "-C", repo_dir, "push", "origin", "main"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=120,
+            )
+            if pushed.returncode != 0:
+                raise RuntimeError((pushed.stderr or pushed.stdout or "git push 失敗").strip())
+
+            self.root.after(0, lambda: self._finish_github_pages_publish("手機頁網址已自動同步到 GitHub Pages。"))
+        except Exception as exc:
+            self.root.after(0, lambda: self._finish_github_pages_publish(f"手機頁網址同步失敗：{exc}"))
+
+    def _finish_github_pages_publish(self, message: str) -> None:
+        self.github_pages_publish_running = False
+        if message:
+            self.status_var.set(message)
 
     def _restore_cached_snapshot(self) -> bool:
         payload = self.gui_snapshot if isinstance(self.gui_snapshot, dict) else {}
@@ -1323,7 +1440,8 @@ class ScreenerApp:
         company_scroll.grid(row=0, column=1, sticky="ns")
 
     def _build_podcast_tab(self) -> None:
-        self.podcast_tab.grid_rowconfigure(2, weight=1)
+        self.podcast_tab.grid_rowconfigure(2, weight=2)
+        self.podcast_tab.grid_rowconfigure(3, weight=1)
         self.podcast_tab.grid_columnconfigure(0, weight=1)
 
         controls = tk.Frame(self.podcast_tab, bg=PAGE_BG)
@@ -1341,6 +1459,7 @@ class ScreenerApp:
 
         top = tk.Frame(self.podcast_tab, bg=PAGE_BG)
         top.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.podcast_top_panel = top
         top.grid_columnconfigure(0, weight=2)
         top.grid_columnconfigure(1, weight=3)
         top.grid_columnconfigure(2, weight=3)
@@ -1354,6 +1473,7 @@ class ScreenerApp:
 
         summary_panel = tk.Frame(top, bg=PANEL_BG, highlightbackground=BORDER, highlightthickness=1, padx=16, pady=12)
         summary_panel.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        self.podcast_summary_panel = summary_panel
         tk.Label(summary_panel, text="本集摘要", bg=PANEL_BG, fg=TEXT_DARK, font=("Microsoft JhengHei UI", 13, "bold")).pack(anchor="w")
         self.podcast_summary_text = tk.Text(summary_panel, height=6, wrap="word", font=("Microsoft JhengHei UI", 10), bg=PANEL_BG, fg=TEXT_DARK, relief="flat", bd=0)
         self.podcast_summary_text.pack(fill="both", expand=True, pady=(6, 0))
@@ -1371,16 +1491,59 @@ class ScreenerApp:
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
-        columns = ("排名", "代號", "公司", "產業", "股價", "信心分數", "受惠邏輯", "節目證據", "催化劑", "風險", "觀察指標")
-        self.podcast_tree = ttk.Treeview(body, columns=columns, show="headings", height=16)
-        widths = (60, 80, 120, 110, 80, 80, 260, 260, 180, 180, 180)
+        columns = ("排名", "代號", "公司", "產業", "股價", "信心分數")
+        self.podcast_tree = ttk.Treeview(body, columns=columns, show="headings", height=14)
+        widths = (58, 88, 170, 190, 92, 92)
         for col, width in zip(columns, widths):
             self.podcast_tree.heading(col, text=col)
             self.podcast_tree.column(col, width=width, anchor="center" if col in {"排名", "代號", "股價", "信心分數"} else "w")
+        self.podcast_tree.bind("<<TreeviewSelect>>", self._on_podcast_select)
         podcast_scroll = ttk.Scrollbar(body, orient="vertical", command=self.podcast_tree.yview)
         self.podcast_tree.configure(yscrollcommand=podcast_scroll.set)
         self.podcast_tree.grid(row=0, column=0, sticky="nsew")
         podcast_scroll.grid(row=0, column=1, sticky="ns")
+
+        detail_panel = ttk.LabelFrame(self.podcast_tab, text="股癌個股詳情", style="Panel.TLabelframe", padding=10)
+        detail_panel.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        detail_panel.grid_columnconfigure(0, weight=1)
+        detail_panel.grid_columnconfigure(1, weight=1)
+        detail_panel.grid_rowconfigure(0, weight=1)
+
+        detail_left = tk.Frame(detail_panel, bg=PANEL_BG)
+        detail_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        detail_left.grid_rowconfigure(1, weight=1)
+        detail_left.grid_columnconfigure(0, weight=1)
+        tk.Label(detail_left, text="受惠邏輯 / 節目證據", bg=PANEL_BG, fg=TEXT_DARK, font=("Microsoft JhengHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+        self.podcast_detail_main_text = tk.Text(
+            detail_left,
+            height=10,
+            wrap="word",
+            font=("Microsoft JhengHei UI", 10),
+            bg=PANEL_BG,
+            fg=TEXT_DARK,
+            relief="flat",
+            bd=0,
+        )
+        self.podcast_detail_main_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.podcast_detail_main_text.bind("<Key>", self._readonly_text)
+
+        detail_right = tk.Frame(detail_panel, bg=ACCENT_BG)
+        detail_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        detail_right.grid_rowconfigure(1, weight=1)
+        detail_right.grid_columnconfigure(0, weight=1)
+        tk.Label(detail_right, text="催化劑 / 風險 / 觀察指標", bg=ACCENT_BG, fg=TEXT_DARK, font=("Microsoft JhengHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+        self.podcast_detail_side_text = tk.Text(
+            detail_right,
+            height=10,
+            wrap="word",
+            font=("Microsoft JhengHei UI", 10),
+            bg=ACCENT_BG,
+            fg=TEXT_DARK,
+            relief="flat",
+            bd=0,
+        )
+        self.podcast_detail_side_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.podcast_detail_side_text.bind("<Key>", self._readonly_text)
         self._render_podcast_tab()
 
     def reload_podcast_tab(self) -> None:
@@ -1701,9 +1864,14 @@ class ScreenerApp:
         self.podcast_meta_text.delete("1.0", "end")
         self.podcast_meta_text.insert("1.0", "\n".join(meta_lines))
 
-        summary = self.podcast_meta.get("summary") or "目前沒有讀到股癌摘要，仍可直接參考下方推薦名單。"
-        self.podcast_summary_text.delete("1.0", "end")
-        self.podcast_summary_text.insert("1.0", summary)
+        summary = str(self.podcast_meta.get("summary") or "").strip()
+        has_summary = bool(summary)
+        if has_summary:
+            self.podcast_summary_panel.grid()
+            self.podcast_summary_text.delete("1.0", "end")
+            self.podcast_summary_text.insert("1.0", summary)
+        else:
+            self.podcast_summary_panel.grid_remove()
 
         sections = podcast_signal_sections(self.podcast_meta or {})
         signal_lines = [
@@ -1716,7 +1884,8 @@ class ScreenerApp:
         self.podcast_signal_text.insert("1.0", "\n".join(signal_lines))
 
         if not self.podcast_rows:
-            self.podcast_tree.insert("", tk.END, values=("", "", "尚未找到股癌推薦結果", "", "", "", "", "", "", "", "請先產生 podcast_output/podcast_recommendations.csv"))
+            self.podcast_tree.insert("", tk.END, values=("", "", "尚未找到股癌推薦結果", "", "", ""))
+            self._render_podcast_detail(None)
             return
 
         for index, row in enumerate(self.podcast_rows, start=1):
@@ -1730,13 +1899,59 @@ class ScreenerApp:
                     row.get("industry", ""),
                     row.get("price", ""),
                     row.get("confidence_score", ""),
-                    row.get("benefit_logic", ""),
-                    row.get("evidence_from_episode", ""),
-                    row.get("catalyst", ""),
-                    row.get("risk", ""),
-                    row.get("metrics_to_track", ""),
                 ),
             )
+
+        children = self.podcast_tree.get_children()
+        if children:
+            self.podcast_tree.selection_set(children[0])
+            self.podcast_tree.focus(children[0])
+            self._render_podcast_detail(self.podcast_rows[0])
+
+    def _on_podcast_select(self, _event=None) -> None:
+        selection = self.podcast_tree.selection()
+        if not selection:
+            self._render_podcast_detail(None)
+            return
+        values = self.podcast_tree.item(selection[0], "values")
+        ticker = str(values[1]).strip() if len(values) > 1 else ""
+        target = None
+        for row in self.podcast_rows:
+            if str(row.get("ticker", "")).strip() == ticker:
+                target = row
+                break
+        self._render_podcast_detail(target)
+
+    def _render_podcast_detail(self, row) -> None:
+        main_text = "請先在上方選一檔推薦股，下面會顯示完整的受惠邏輯與節目證據。"
+        side_text = "催化劑、風險與觀察指標會顯示在這裡，方便你判斷後續該追什麼。"
+        if row:
+            company = str(row.get("company") or row.get("ticker") or "--")
+            ticker = str(row.get("ticker") or "--")
+            industry = str(row.get("industry") or "--")
+            price = str(row.get("price") or "--")
+            score = str(row.get("confidence_score") or "--")
+            benefit_logic = str(row.get("benefit_logic") or "--")
+            evidence = str(row.get("evidence_from_episode") or "--")
+            catalyst = str(row.get("catalyst") or "--")
+            risk = str(row.get("risk") or "--")
+            metrics = str(row.get("metrics_to_track") or "--")
+            main_text = (
+                f"{company} ({ticker})\n"
+                f"產業：{industry}\n"
+                f"股價：{price} / 信心分數：{score}\n\n"
+                f"受惠邏輯：\n{benefit_logic}\n\n"
+                f"節目證據：\n{evidence}"
+            )
+            side_text = (
+                f"催化劑：\n{catalyst}\n\n"
+                f"風險：\n{risk}\n\n"
+                f"觀察指標：\n{metrics}"
+            )
+        self.podcast_detail_main_text.delete("1.0", "end")
+        self.podcast_detail_main_text.insert("1.0", main_text)
+        self.podcast_detail_side_text.delete("1.0", "end")
+        self.podcast_detail_side_text.insert("1.0", side_text)
 
     def _set_progress(self, value: float) -> None:
         value = max(0.0, min(100.0, value))
